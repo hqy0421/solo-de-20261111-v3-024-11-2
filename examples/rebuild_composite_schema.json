@@ -1,0 +1,19 @@
+{
+  "key": ["order_id", "region"],
+  "columns": {
+    "oid": "order_id",
+    "region": "region",
+    "customer": "customer"
+  },
+  "children": {
+    "lines": {
+      "key": "line_no",
+      "columns": {
+        "ln": "line_no",
+        "sku": "sku",
+        "price": "price"
+      },
+      "order_by": "line_no"
+    }
+  }
+}

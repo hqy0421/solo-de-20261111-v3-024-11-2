@@ -1,0 +1,14 @@
+{
+  "key": "order_id",
+  "children": {
+    "items": {
+      "key": "line_no",
+      "order_by": "line_no",
+      "children": {
+        "discounts": {
+          "key": "code"
+        }
+      }
+    }
+  }
+}

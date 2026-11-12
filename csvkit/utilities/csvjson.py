@@ -2,11 +2,14 @@
 
 import json
 import sys
+import textwrap
 from collections import OrderedDict
 
 import agate
+from agate.data_types.base import DEFAULT_NULL_VALUES
 
-from csvkit.cli import CSVKitUtility, default_str_decimal, match_column_identifier
+from csvkit.cli import CSVKitUtility, default_float_decimal, default_str_decimal, match_column_identifier
+from csvkit.rebuild import MemoryStore, Rebuilder, RebuildSchemaError, SQLiteStore, load_schema
 
 
 class CSVJSON(CSVKitUtility):
@@ -46,6 +49,15 @@ class CSVJSON(CSVKitUtility):
             '--stream', dest='streamOutput', action='store_true',
             help='Output JSON as a stream of newline-separated objects, rather than an as an array.')
         self.argparser.add_argument(
+            '--rebuild', dest='rebuild', metavar='SCHEMA',
+            help='Rebuild nested JSON from a denormalized CSV (such as a join result), using a JSON schema file '
+                 'that declares the parent-child paths and the composite key of each level. Rows are merged by '
+                 'business identity instead of producing one object per row.')
+        self.argparser.add_argument(
+            '--spill', dest='spill', action='store_true',
+            help='With --rebuild: keep the object index in a temporary on-disk database instead of in memory, '
+                 'for large inputs. The temporary directory is chosen via TMPDIR.')
+        self.argparser.add_argument(
             '-y', '--snifflimit', dest='sniff_limit', type=int, default=1024,
             help='Limit CSV dialect sniffing to the specified number of bytes. '
                  'Specify "0" to disable sniffing entirely, or "-1" to sniff the entire file.')
@@ -73,9 +85,24 @@ class CSVJSON(CSVKitUtility):
         if self.args.key and self.args.streamOutput and not (self.args.lat and self.args.lon):
             self.argparser.error('--key is only allowed with --stream when --lat and --lon are also specified.')
 
+        if self.args.rebuild:
+            if self.args.key:
+                self.argparser.error('--key is not allowed with --rebuild. The root key is declared in the schema.')
+            if self.is_geo():
+                self.argparser.error('--lat and --lon are not allowed with --rebuild.')
+        elif self.args.spill:
+            self.argparser.error('--spill is only allowed with --rebuild.')
+
         self.json_kwargs = {
             'indent': self.args.indent,
         }
+
+        if self.args.rebuild:
+            if self.additional_input_expected():
+                self.argparser.error('You must provide an input file or piped data.')
+
+            self.output_rebuild()
+            return
 
         if self.can_stream():
             if self.additional_input_expected():
@@ -128,6 +155,100 @@ class CSVJSON(CSVKitUtility):
             newline=self.args.streamOutput,
             indent=self.args.indent,
         )
+
+    def output_rebuild(self):
+        """
+        Merge a denormalized CSV into nested JSON objects, as declared by the
+        --rebuild schema.
+        """
+        if self.args.no_inference and self.args.sniff_limit == 0 and not self.args.skip_lines:
+            # Stream the input with constant memory, like streaming_output_ndjson.
+            text_type = self.get_text_type()
+            rows = agate.csv.reader(self.input_file, **self.reader_kwargs)
+            column_names = next(rows)
+
+            def iter_rows():
+                for row_number, row in enumerate(rows, 1):
+                    yield row_number, [text_type.cast(value) for value in row]
+        else:
+            table = self.read_csv_to_table()
+            column_names = table.column_names
+
+            def iter_rows():
+                for row_number, row in enumerate(table.rows, 1):
+                    yield row_number, row
+
+        try:
+            schema = load_schema(self.args.rebuild)
+            schema.resolve_columns(column_names, self.get_column_offset())
+        except RebuildSchemaError as e:
+            self.argparser.error(str(e))
+
+        store = SQLiteStore() if self.args.spill else MemoryStore()
+        try:
+            rebuilder = Rebuilder(schema, store, self.error_file, prog=type(self).__name__.lower())
+
+            for row_number, values in iter_rows():
+                rebuilder.add_row(row_number, values)
+
+            if self.args.streamOutput:
+                for obj in rebuilder.iter_roots():
+                    self.dump_rebuild_object(obj, newline=True)
+            else:
+                self.dump_rebuild_array(rebuilder.iter_roots())
+
+            rebuilder.report_summary()
+        finally:
+            store.close()
+
+    def get_text_type(self):
+        """
+        The agate.Text instance used to detect nulls when streaming raw rows,
+        mirroring the null handling of get_column_types.
+        """
+        if getattr(self.args, 'blanks', None):
+            null_values = []
+        else:
+            null_values = list(DEFAULT_NULL_VALUES)
+        null_values.extend(getattr(self.args, 'null_values', None) or [])
+
+        return agate.Text(null_values=null_values)
+
+    def dump_rebuild_object(self, data, newline=False):
+        json.dump(data, self.output_file, default=default_float_decimal, ensure_ascii=False, **self.json_kwargs)
+        if newline:
+            self.output_file.write("\n")
+
+    def dump_rebuild_array(self, roots):
+        """
+        Write the root objects as one JSON array, streaming root by root so
+        that large results are not held in memory.
+        """
+        indent = self.args.indent
+
+        if indent is None:
+            self.output_file.write('[')
+            for i, obj in enumerate(roots):
+                if i:
+                    self.output_file.write(', ')
+                self.dump_rebuild_object(obj)
+            self.output_file.write(']')
+            return
+
+        pad = ' ' * indent
+        first = True
+        for obj in roots:
+            if first:
+                self.output_file.write('[\n')
+                first = False
+            else:
+                self.output_file.write(',\n')
+            text = json.dumps(obj, default=default_float_decimal, ensure_ascii=False, **self.json_kwargs)
+            self.output_file.write(textwrap.indent(text, pad))
+        if first:
+            self.output_file.write('[]')
+        else:
+            self.output_file.write('\n]')
 
     def output_geojson(self):
         table = self.read_csv_to_table()

@@ -1,0 +1,4 @@
+order_id,customer,items.line_no,items.sku,items.qty
+O-201,Grace,1,SKU-1,1
+O-201,Grace,1,SKU-1,2
+O-201,G.,2,SKU-9,5

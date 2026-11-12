@@ -1,0 +1,4 @@
+order_id,customer,placed,items.line_no,items.sku,items.qty,items.discounts.code,items.discounts.amount
+O-401,Lea,2024-06-01,,,,WELCOME,3
+,Ned,2024-06-02,1,SKU-1,1,,
+O-401,Lea,2024-06-01,2,SKU-2,2,,

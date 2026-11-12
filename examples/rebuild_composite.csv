@@ -1,0 +1,5 @@
+oid,region,customer,ln,sku,price,note
+A-1,EU,Ada,1,X,10,fragile
+A-1,EU,Ada,2,Y,20,
+A-1,US,Ada,1,Z,30,gift
+A-1,EU,Ada,1,X,10,

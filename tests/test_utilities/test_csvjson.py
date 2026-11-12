@@ -1,6 +1,7 @@
 import io
 import json
 import sys
+from contextlib import redirect_stderr
 from unittest.mock import patch
 
 from csvkit.utilities.csvjson import CSVJSON, launch_new_instance
@@ -9,6 +10,18 @@ from tests.utils import CSVKitTestCase, EmptyFileTests
 
 class TestCSVJSON(CSVKitTestCase, EmptyFileTests):
     Utility = CSVJSON
+
+    def get_output_and_error(self, args):
+        output_file = io.TextIOWrapper(io.BytesIO(), encoding='utf-8', newline='', write_through=True)
+        error_file = io.StringIO()
+
+        utility = self.Utility(args, output_file, error_file)
+        utility.run()
+
+        output = output_file.buffer.getvalue().decode('utf-8')
+        output_file.close()
+
+        return output, error_file.getvalue()
 
     def test_launch_new_instance(self):
         with patch.object(sys, 'argv', [self.Utility.__name__.lower(), 'examples/dummy.csv']):
@@ -254,3 +267,148 @@ class TestCSVJSON(CSVKitTestCase, EmptyFileTests):
             '{"type": "Feature", "properties": {"slug": "obeidder", "title": "Obeidder Monster", "description": "Sharpie and Spray Paint", "address": "3319 Seaton St.", "type": "Street Art", "photo_url": "http://i.imgur.com/3aX7E.jpg", "photo_credit": "Photo by Justin Edwards. Used with permission.", "last_seen_date": "4/15/12"}, "geometry": {"type": "Point", "coordinates": [-95.334619, 32.314431]}}',  # noqa: E501
             '{"type": "Feature", "properties": {"slug": "sensor-device", "title": "Sensor Device", "artist": "Kurt Dyrhaug", "address": "University of Texas, Campus Drive", "type": "Sculpture", "photo_url": "http://media.hacktyler.com/artmap/photos/sensor-device.jpg", "photo_credit": "Photo by Christopher Groskopf. Used with permission.", "last_seen_date": "4/16/12"}, "geometry": {"type": "Point", "coordinates": [-95.250699, 32.317216]}}',  # noqa: E501
         ])
+
+    def test_rebuild(self):
+        js = json.loads(self.get_output(['--rebuild', 'examples/rebuild_orders_schema.json',
+                                         'examples/rebuild_orders.csv']))
+        self.assertEqual(js, [
+            {
+                # Rows are out of order: O-102 appears first in the input.
+                'order_id': 'O-102', 'customer': 'Ana', 'placed': '2024-05-01',
+                'items': [
+                    # Items are sorted by the declared order_by, not by row order.
+                    {'line_no': 1.0, 'sku': 'SKU-7', 'qty': 3.0, 'discounts': [
+                        {'code': 'WELCOME', 'amount': 2.5},
+                        # A null value is not a missing child.
+                        {'code': 'FLASH', 'amount': None},
+                    ]},
+                    {'line_no': 2.0, 'sku': 'SKU-8', 'qty': 1.0, 'discounts': []},
+                ],
+            },
+            {
+                'order_id': 'O-101', 'customer': 'Ben', 'placed': '2024-05-02',
+                'items': [
+                    # Join fan-out: repeated rows merge into one object per key.
+                    {'line_no': 1.0, 'sku': 'SKU-1', 'qty': 2.0, 'discounts': [
+                        {'code': 'SAVE10', 'amount': 5.0},
+                    ]},
+                    {'line_no': 2.0, 'sku': 'SKU-2', 'qty': 1.0, 'discounts': []},
+                ],
+            },
+            {
+                # A missing child (all of its columns are null) is an empty array.
+                'order_id': 'O-103', 'customer': 'Cid', 'placed': '2024-05-03', 'items': [],
+            },
+        ])
+
+    def test_rebuild_streaming_no_inference(self):
+        lines = self.get_output_as_list(['--rebuild', 'examples/rebuild_orders_schema.json', '--stream',
+                                         '--no-inference', '--snifflimit', '0', 'examples/rebuild_orders.csv'])
+        self.assertEqual(len(lines), 4)  # 3 objects + trailing newline
+        js = [json.loads(line) for line in lines[:3]]
+        self.assertEqual([obj['order_id'] for obj in js], ['O-102', 'O-101', 'O-103'])
+        self.assertEqual(js[0]['items'][0]['qty'], '3')
+        self.assertIsNone(js[0]['items'][0]['discounts'][1]['amount'])
+        self.assertEqual(js[2]['items'], [])
+
+    def test_rebuild_indent(self):
+        output = self.get_output(['--rebuild', 'examples/rebuild_conflict_schema.json',
+                                  '-i', '2', 'examples/rebuild_conflict.csv'])
+        js = json.loads(output)
+        self.assertEqual(len(js), 1)
+        self.assertTrue(output.startswith('[\n  {\n    "order_id": "O-201"'))
+        self.assertTrue(output.endswith('\n]'))
+
+    def test_rebuild_spill_matches_memory(self):
+        args = ['--rebuild', 'examples/rebuild_orders_schema.json', 'examples/rebuild_orders.csv']
+        self.assertEqual(self.get_output(args), self.get_output(args + ['--spill']))
+
+    def test_rebuild_conflicts(self):
+        output, error = self.get_output_and_error(['--rebuild', 'examples/rebuild_conflict_schema.json',
+                                                   'examples/rebuild_conflict.csv'])
+        js = json.loads(output)
+        # The first-seen value wins.
+        self.assertEqual(js, [
+            {'order_id': 'O-201', 'customer': 'Grace', 'items': [
+                {'line_no': 1.0, 'sku': 'SKU-1', 'qty': 1.0},
+                {'line_no': 2.0, 'sku': 'SKU-9', 'qty': 5.0},
+            ]},
+        ])
+        # Conflicts report the field, both values and both source rows.
+        self.assertIn(
+            'csvjson: conflict at $[order_id="O-201"].items[line_no=1.0].qty: kept 1.0 (row 1), ignored 2.0 (row 2)',
+            error,
+        )
+        self.assertIn(
+            'csvjson: conflict at $[order_id="O-201"].customer: kept "Grace" (row 1), ignored "G." (row 3)',
+            error,
+        )
+        self.assertIn('csvjson: warning: 2 scalar conflict(s) detected', error)
+
+    def test_rebuild_orphans(self):
+        output, error = self.get_output_and_error(['--rebuild', 'examples/rebuild_orders_schema.json',
+                                                   'examples/rebuild_orphans.csv'])
+        js = json.loads(output)
+        self.assertEqual(js, [
+            {'order_id': 'O-401', 'customer': 'Lea', 'placed': '2024-06-01', 'items': [
+                {'line_no': 2.0, 'sku': 'SKU-2', 'qty': 2.0, 'discounts': []},
+            ]},
+        ])
+        self.assertIn('csvjson: warning: row 1: ignoring items.discounts values: items is missing', error)
+        self.assertIn('csvjson: warning: row 2 skipped: all root key columns are null', error)
+
+    def test_rebuild_composite_key_and_column_map(self):
+        js = json.loads(self.get_output(['--rebuild', 'examples/rebuild_composite_schema.json',
+                                         'examples/rebuild_composite.csv']))
+        self.assertEqual(js, [
+            {'order_id': 'A-1', 'region': 'EU', 'customer': 'Ada', 'note': 'fragile', 'lines': [
+                {'line_no': 1.0, 'sku': 'X', 'price': 10.0},
+                {'line_no': 2.0, 'sku': 'Y', 'price': 20.0},
+            ]},
+            {'order_id': 'A-1', 'region': 'US', 'customer': 'Ada', 'note': 'gift', 'lines': [
+                {'line_no': 1.0, 'sku': 'Z', 'price': 30.0},
+            ]},
+        ])
+
+    def test_rebuild_empty(self):
+        self.assertEqual(
+            self.get_output(['--rebuild', 'examples/rebuild_conflict_schema.json', 'examples/rebuild_empty.csv']),
+            '[]',
+        )
+
+    def test_rebuild_options(self):
+        self.assertError(
+            launch_new_instance,
+            ['--rebuild', 'examples/rebuild_orders_schema.json', '--key', 'order_id'],
+            '--key is not allowed with --rebuild. The root key is declared in the schema.',
+        )
+        self.assertError(
+            launch_new_instance,
+            ['--rebuild', 'examples/rebuild_orders_schema.json', '--lat', 'latitude', '--lon', 'longitude'],
+            '--lat and --lon are not allowed with --rebuild.',
+        )
+        self.assertError(
+            launch_new_instance,
+            ['--spill'],
+            '--spill is only allowed with --rebuild.',
+        )
+        self.assertError(
+            launch_new_instance,
+            ['--rebuild', 'examples/does_not_exist.json'],
+            'Unable to read the rebuild schema "examples/does_not_exist.json": No such file or directory',
+        )
+        self.assertError(
+            launch_new_instance,
+            ['--rebuild', 'examples/rebuild_bad_schema.json'],
+            'The key field "nonexistent" of the root level does not match any column. Available fields: a, b, c.',
+        )
+
+    def test_rebuild_invalid_schema_json(self):
+        f = io.StringIO()
+        with redirect_stderr(f):
+            with patch.object(sys, 'argv', ['csvjson', '--rebuild', 'examples/rebuild_invalid_schema.json',
+                                            'examples/dummy.csv']):
+                with self.assertRaises(SystemExit) as e:
+                    launch_new_instance()
+        self.assertEqual(e.exception.code, 2)
+        self.assertIn('is not valid JSON', f.getvalue())

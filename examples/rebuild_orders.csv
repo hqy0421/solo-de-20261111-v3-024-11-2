@@ -1,0 +1,8 @@
+order_id,customer,placed,items.line_no,items.sku,items.qty,items.discounts.code,items.discounts.amount
+O-102,Ana,2024-05-01,2,SKU-8,1,,
+O-101,Ben,2024-05-02,1,SKU-1,2,SAVE10,5
+O-101,Ben,2024-05-02,2,SKU-2,1,,
+O-102,Ana,2024-05-01,1,SKU-7,3,WELCOME,2.5
+O-101,Ben,2024-05-02,1,SKU-1,2,,
+O-102,Ana,2024-05-01,1,SKU-7,3,FLASH,
+O-103,Cid,2024-05-03,,,,
